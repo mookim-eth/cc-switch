@@ -33,6 +33,8 @@ pub struct StreamingTimeoutConfig {
 /// - 日志标签
 /// - Session ID（用于日志关联）
 pub struct RequestContext {
+    /// Stable ID shared by hooks, interaction records and provider attempts.
+    pub request_id: String,
     /// 请求开始时间
     pub start_time: Instant,
     /// 应用级代理配置（per-app，包含重试次数和超时配置）
@@ -94,9 +96,10 @@ impl RequestContext {
         app_type_str: &'static str,
     ) -> Result<Self, ProxyError> {
         let start_time = Instant::now();
+        let request_id = uuid::Uuid::new_v4().to_string();
 
         // 从数据库读取应用级代理配置（per-app）
-        let app_config = state
+        let mut app_config = state
             .db
             .get_proxy_config_for_app(app_type_str)
             .await
@@ -131,9 +134,9 @@ impl RequestContext {
 
         // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
         // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
-        let providers = state
+        let selection = state
             .provider_router
-            .select_providers(app_type_str)
+            .select_providers_for_model(app_type_str, &request_model)
             .await
             .map_err(|e| match e {
                 crate::error::AppError::AllProvidersCircuitOpen => {
@@ -142,6 +145,13 @@ impl RequestContext {
                 crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
                 _ => ProxyError::DatabaseError(e.to_string()),
             })?;
+        let providers = selection.providers;
+        // A configured model route is itself an explicit candidate queue. It
+        // must retain failover semantics even when the legacy app-wide queue
+        // toggle is disabled.
+        if selection.matched_model_route.is_some() {
+            app_config.auto_failover_enabled = true;
+        }
 
         let provider = providers
             .first()
@@ -157,7 +167,18 @@ impl RequestContext {
             session_id
         );
 
+        crate::proxy::interactions::begin(
+            state.db.clone(),
+            &request_id,
+            &session_id,
+            app_type_str,
+            &request_model,
+            &provider,
+            body,
+        );
+
         Ok(Self {
+            request_id,
             start_time,
             app_config,
             provider,
@@ -224,6 +245,7 @@ impl RequestContext {
         };
 
         RequestForwarder::new(
+            state.db.clone(),
             state.provider_router.clone(),
             non_streaming_timeout,
             state.status.clone(),
@@ -241,6 +263,8 @@ impl RequestContext {
             self.optimizer_config.clone(),
             self.copilot_optimizer_config.clone(),
             max_retries,
+            self.request_id.clone(),
+            self.request_model.clone(),
         )
     }
 

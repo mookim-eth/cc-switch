@@ -32,6 +32,10 @@ mod schema;
 mod tests;
 
 // DAO 类型导出供外部使用
+pub use dao::interactions::{
+    ProxyInteractionAttempt, ProxyInteractionDetail, ProxyInteractionFilters,
+    ProxyInteractionSummary,
+};
 pub(crate) use dao::providers_seed::{
     is_official_seed_id, CLAUDE_DESKTOP_OFFICIAL_PROVIDER_ID, CODEX_OFFICIAL_PROVIDER_ID,
     GROKBUILD_OFFICIAL_PROVIDER_ID,
@@ -53,7 +57,7 @@ use std::sync::Mutex;
 
 /// 当前 Schema 版本号
 /// 每次修改表结构时递增，并在 schema.rs 中添加相应的迁移逻辑
-pub(crate) const SCHEMA_VERSION: i32 = 19;
+pub(crate) const SCHEMA_VERSION: i32 = 20;
 
 /// 安全地序列化 JSON，避免 unwrap panic
 pub(crate) fn to_json_string<T: Serialize>(value: &T) -> Result<String, AppError> {
@@ -154,6 +158,12 @@ impl Database {
         }
         if let Err(e) = db.rollup_and_prune(30) {
             log::warn!("Startup rollup_and_prune failed: {e}");
+        }
+        let interaction_quota_mb = crate::proxy::interactions::get_config(&db)
+            .map(|config| config.quota_mb)
+            .unwrap_or(100);
+        if let Err(e) = db.prune_proxy_interactions(u64::from(interaction_quota_mb) * 1024 * 1024) {
+            log::warn!("Startup proxy interaction cleanup failed: {e}");
         }
         // Reclaim disk space after cleanup
         {

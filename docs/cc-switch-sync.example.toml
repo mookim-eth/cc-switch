@@ -1,0 +1,14 @@
+# Full HTTPS endpoint that returns the current complete route configuration.
+remote_server_url = "https://config.example.com/v1/routes"
+remote_access_token = "replace-with-remote-service-token"
+
+# CC Switch must already be running with proxy takeover enabled for each app.
+cc_switch_url = "http://127.0.0.1:15721"
+cc_switch_control_token = "paste-token-from-cc-switch-settings"
+
+poll_interval_seconds = 30
+apps = "claude,codex"
+
+# Optional. Defaults to <config filename>.state.json.
+# The state file stores only revision, ETag, and last-success time.
+# state_file = "/path/to/cc-switch-sync.state.json"

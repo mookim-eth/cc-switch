@@ -15,7 +15,7 @@ use super::{
         claude_stream_usage_event_filter, codex_stream_usage_event_filter, CLAUDE_PARSER_CONFIG,
         CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
     },
-    handler_context::RequestContext,
+    handler_context::{extract_gemini_model_from_path, RequestContext},
     providers::{
         codex_chat_common::extract_reasoning_field_text,
         codex_chat_history::record_responses_sse_stream,
@@ -36,9 +36,10 @@ use super::{
         transform_gemini, transform_responses,
     },
     response_processor::{
-        create_logged_passthrough_stream, create_usage_collector, process_response,
-        read_decoded_body, strip_entity_headers_for_rebuilt_body,
-        strip_hop_by_hop_response_headers, usage_logging_enabled, SseUsageCollector,
+        create_interaction_collector, create_logged_passthrough_stream, create_usage_collector,
+        finalize_json_response, process_response, read_decoded_body,
+        strip_entity_headers_for_rebuilt_body, strip_hop_by_hop_response_headers,
+        usage_logging_enabled, SseUsageCollector,
     },
     server::ProxyState,
     sse::{strip_sse_field, take_sse_block},
@@ -521,6 +522,7 @@ async fn handle_claude_transform(
             usage_collector,
             timeout_config,
             connection_guard,
+            create_interaction_collector(ctx, state, status.as_u16()),
         );
 
         let mut headers = axum::http::HeaderMap::new();
@@ -675,6 +677,8 @@ async fn handle_claude_transform(
     // 全 0 usage 不落账（对齐 Codex 流式收集器的 skip）：SSE 聚合兜底救回的流
     // 在上游缺 stream_options.include_usage 时没有 usage，写入只会产生无意义空行
     spawn_claude_usage_log(state, ctx, &anthropic_response, status.as_u16(), false);
+    let anthropic_response =
+        finalize_json_response(anthropic_response, ctx, state, status.as_u16()).await?;
 
     // 构建响应
     let mut builder = axum::response::Response::builder().status(status);
@@ -1224,6 +1228,7 @@ async fn handle_codex_xai_native_responses_rewrite(
             usage_collector,
             ctx.streaming_timeout_config(),
             connection_guard,
+            create_interaction_collector(ctx, state, status.as_u16()),
         );
 
         let body = axum::body::Body::from_stream(logged_stream);
@@ -1298,6 +1303,7 @@ async fn handle_codex_xai_native_responses_rewrite(
                     }
                 });
             }
+            let value = finalize_json_response(value, ctx, state, status.as_u16()).await?;
             match serde_json::to_vec(&value) {
                 Ok(bytes) => Bytes::from(bytes),
                 Err(e) => {
@@ -1420,6 +1426,7 @@ async fn handle_codex_chat_to_responses_transform(
             usage_collector,
             ctx.streaming_timeout_config(),
             connection_guard,
+            create_interaction_collector(ctx, state, status.as_u16()),
         );
 
         let mut headers = axum::http::HeaderMap::new();
@@ -1482,6 +1489,8 @@ async fn handle_codex_chat_to_responses_transform(
         log::error!("[Codex] Chat → Responses 响应转换失败: {e}");
         e
     })?;
+    let responses_response =
+        finalize_json_response(responses_response, ctx, state, status.as_u16()).await?;
     state
         .codex_chat_history
         .record_response(&responses_response)
@@ -1655,6 +1664,8 @@ async fn handle_codex_anthropic_to_responses_transform(
             log::error!("[Codex] Failed to convert Anthropic response to Responses: {e}");
             e
         })?;
+    let responses_response =
+        finalize_json_response(responses_response, ctx, state, status.as_u16()).await?;
 
     if let Some(usage) = TokenUsage::from_codex_response_auto(&responses_response)
         .filter(TokenUsage::has_billable_tokens)
@@ -1793,6 +1804,7 @@ fn build_codex_anthropic_sse_response(
         usage_collector,
         ctx.streaming_timeout_config(),
         connection_guard,
+        create_interaction_collector(ctx, state, status.as_u16()),
     );
 
     let mut headers = axum::http::HeaderMap::new();
@@ -2098,10 +2110,26 @@ pub async fn handle_gemini(
             .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?
     };
 
-    // Gemini 的模型名称在 URI 中
-    let mut ctx = RequestContext::new(&state, &body, &headers, AppType::Gemini, "Gemini", "gemini")
-        .await?
-        .with_model_from_uri(&uri);
+    // Gemini 的模型名称在 URI 中。先把客户端模型投影到仅用于上下文构建的
+    // body，确保模型级 Provider 路由发生在选择 Provider 之前。
+    let mut routing_body = body.clone();
+    if let Some(model) = extract_gemini_model_from_path(uri.path()) {
+        if let Some(object) = routing_body.as_object_mut() {
+            object.insert("model".to_string(), Value::String(model));
+        } else {
+            routing_body = json!({ "model": model });
+        }
+    }
+    let mut ctx = RequestContext::new(
+        &state,
+        &routing_body,
+        &headers,
+        AppType::Gemini,
+        "Gemini",
+        "gemini",
+    )
+    .await?
+    .with_model_from_uri(&uri);
 
     // 提取完整的路径和查询参数
     let endpoint = uri
@@ -2778,7 +2806,7 @@ fn log_forward_error(
     let logger = UsageLogger::new(&state.db);
     let status_code = map_proxy_error_to_status(error);
     let error_message = get_error_message(error);
-    let request_id = uuid::Uuid::new_v4().to_string();
+    let request_id = ctx.request_id.clone();
 
     if let Err(e) = logger.log_error_with_context(
         request_id,
@@ -2794,6 +2822,18 @@ fn log_forward_error(
     ) {
         log::warn!("记录失败请求日志失败: {e}");
     }
+    super::interactions::complete(
+        state.db.clone(),
+        &ctx.request_id,
+        ctx.app_type_str,
+        &ctx.request_model,
+        ctx.outbound_model.as_deref(),
+        &ctx.provider,
+        status_code,
+        is_streaming,
+        None,
+        None,
+    );
 }
 
 /// 记录请求使用量

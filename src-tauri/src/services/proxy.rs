@@ -421,6 +421,20 @@ impl ProxyService {
         }
     }
 
+    /// Create a non-owning operational handle for requests served by the
+    /// proxy's own control plane. It shares all state needed by provider
+    /// transactions except the running `ProxyServer` slot, preventing a
+    /// reference cycle when the handle is stored inside that server.
+    fn local_control_handle(&self) -> Self {
+        Self {
+            db: self.db.clone(),
+            codex_oauth_manager: self.codex_oauth_manager.clone(),
+            server: Arc::new(RwLock::new(None)),
+            app_handle: self.app_handle.clone(),
+            switch_locks: self.switch_locks.clone(),
+        }
+    }
+
     #[cfg(test)]
     fn apply_claude_takeover_fields(config: &mut Value, proxy_url: &str) {
         Self::apply_claude_takeover_fields_with_policy(
@@ -966,7 +980,17 @@ impl ProxyService {
 
         // 4. 创建并启动服务器
         let app_handle = self.app_handle.read().await.clone();
-        let server = ProxyServer::new(config.clone(), self.db.clone(), app_handle);
+        let control_state = crate::store::AppState::for_local_control(
+            self.db.clone(),
+            self.local_control_handle(),
+            self.codex_oauth_manager.clone(),
+        );
+        let server = ProxyServer::new_with_control_state(
+            config.clone(),
+            self.db.clone(),
+            app_handle,
+            control_state,
+        );
         let info = server
             .start()
             .await
@@ -3998,7 +4022,17 @@ impl ProxyService {
             }
 
             let app_handle = self.app_handle.read().await.clone();
-            let new_server = ProxyServer::new(new_config.clone(), self.db.clone(), app_handle);
+            let control_state = crate::store::AppState::for_local_control(
+                self.db.clone(),
+                self.local_control_handle(),
+                self.codex_oauth_manager.clone(),
+            );
+            let new_server = ProxyServer::new_with_control_state(
+                new_config.clone(),
+                self.db.clone(),
+                app_handle,
+                control_state,
+            );
             let info = new_server
                 .start()
                 .await

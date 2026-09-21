@@ -29,4 +29,23 @@ impl AppState {
             codex_oauth_manager,
         }
     }
+
+    /// Build the lightweight state used by the local HTTP control plane.
+    ///
+    /// The supplied proxy service shares provider-switch locks and OAuth state
+    /// with the real service, but deliberately owns an empty server slot. This
+    /// avoids a strong reference cycle (`ProxyServer -> AppState -> ProxyService
+    /// -> ProxyServer`) while retaining the transactional ProviderService path.
+    pub(crate) fn for_local_control(
+        db: Arc<Database>,
+        proxy_service: ProxyService,
+        codex_oauth_manager: Arc<CodexOAuthManager>,
+    ) -> Self {
+        Self {
+            db,
+            proxy_service,
+            usage_cache: Arc::new(UsageCache::new()),
+            codex_oauth_manager,
+        }
+    }
 }

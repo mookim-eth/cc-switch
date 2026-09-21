@@ -28,6 +28,11 @@ pub struct ProviderRouter {
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
 }
 
+pub struct ProviderSelection {
+    pub providers: Vec<Provider>,
+    pub matched_model_route: Option<String>,
+}
+
 impl ProviderRouter {
     /// 创建新的供应商路由器
     pub fn new(db: Arc<Database>) -> Self {
@@ -128,6 +133,65 @@ impl ProviderRouter {
         }
 
         Ok(result)
+    }
+
+    /// Select providers for the client-requested model before any provider-level
+    /// outbound model rewrite occurs.
+    pub async fn select_providers_for_model(
+        &self,
+        app_type: &str,
+        client_model: &str,
+    ) -> Result<ProviderSelection, AppError> {
+        let Some(routes) = crate::proxy::control::load_model_routes(&self.db, app_type)? else {
+            return Ok(ProviderSelection {
+                providers: self.select_providers(app_type).await?,
+                matched_model_route: None,
+            });
+        };
+        let (candidate_ids, matched_rule) = routes.resolve(client_model);
+        if candidate_ids.is_empty() && matched_rule == "default" {
+            return Ok(ProviderSelection {
+                providers: self.select_providers(app_type).await?,
+                matched_model_route: None,
+            });
+        }
+        let all_providers = self.db.get_all_providers(app_type)?;
+        let mut providers = Vec::with_capacity(candidate_ids.len());
+        let mut circuit_open_count = 0_usize;
+
+        for provider_id in candidate_ids {
+            let provider = all_providers.get(provider_id).cloned().ok_or_else(|| {
+                AppError::Database(format!(
+                    "Saved model route references missing provider {provider_id}"
+                ))
+            })?;
+            if !provider_supports_failover(app_type, &provider) {
+                continue;
+            }
+            let circuit_key = format!("{app_type}:{}", provider.id);
+            let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
+            if breaker.is_available().await {
+                providers.push(provider);
+            } else {
+                circuit_open_count += 1;
+            }
+        }
+
+        if providers.is_empty() {
+            if !candidate_ids.is_empty() && circuit_open_count == candidate_ids.len() {
+                return Err(AppError::AllProvidersCircuitOpen);
+            }
+            return Err(AppError::NoProvidersConfigured);
+        }
+        log::info!(
+            "Model route matched: app={app_type}, client_model={client_model}, rule={matched_rule}, candidates={}, selected={}",
+            candidate_ids.len(),
+            providers[0].id
+        );
+        Ok(ProviderSelection {
+            providers,
+            matched_model_route: Some(matched_rule),
+        })
     }
 
     /// 请求执行前获取熔断器“放行许可”
@@ -374,7 +438,7 @@ mod tests {
     async fn test_provider_router_creation() {
         let _home = TempHome::new();
         let db = Arc::new(Database::memory().unwrap());
-        let router = ProviderRouter::new(db);
+        let router = ProviderRouter::new(db.clone());
 
         let breaker = router.get_or_create_circuit_breaker("claude:test").await;
         assert!(breaker.allow_request().await.allowed);
@@ -401,6 +465,76 @@ mod tests {
 
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id, "a");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn model_routes_override_app_current_and_preserve_candidate_order() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        for id in ["current", "gpt-primary", "gpt-fallback", "default"] {
+            db.save_provider(
+                "codex",
+                &Provider::with_id(id.to_string(), id.to_string(), json!({}), None),
+            )
+            .unwrap();
+        }
+        db.set_current_provider("codex", "current").unwrap();
+        db.set_setting(
+            "model_routes_codex",
+            &json!({
+                "revision": "r1",
+                "rules": [{
+                    "model": "gpt-*",
+                    "providers": ["gpt-primary", "gpt-fallback"]
+                }],
+                "defaultProviders": ["default"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+        let matched = router
+            .select_providers_for_model("codex", "gpt-5.4")
+            .await
+            .unwrap();
+        assert_eq!(
+            matched
+                .providers
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gpt-primary", "gpt-fallback"]
+        );
+        assert_eq!(
+            matched.matched_model_route.as_deref(),
+            Some("wildcard:gpt-*")
+        );
+
+        let unmatched = router
+            .select_providers_for_model("codex", "claude-sonnet")
+            .await
+            .unwrap();
+        assert_eq!(unmatched.providers[0].id, "default");
+        assert_eq!(unmatched.matched_model_route.as_deref(), Some("default"));
+
+        db.set_setting(
+            "model_routes_codex",
+            &json!({
+                "revision": "r2",
+                "rules": [],
+                "defaultProviders": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let app_fallback = router
+            .select_providers_for_model("codex", "claude-sonnet")
+            .await
+            .unwrap();
+        assert_eq!(app_fallback.providers[0].id, "current");
+        assert_eq!(app_fallback.matched_model_route, None);
     }
 
     #[tokio::test]

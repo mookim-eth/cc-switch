@@ -353,6 +353,50 @@ impl Database {
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // 20. Full proxy interaction metadata and optional redacted bodies.
+        // This is deliberately separate from proxy_request_logs: usage rollup
+        // and retention must never depend on full-content recording.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS proxy_interactions (
+                request_id TEXT PRIMARY KEY,
+                session_id TEXT,
+                app_type TEXT NOT NULL,
+                client_model TEXT NOT NULL,
+                outbound_model TEXT,
+                final_provider_id TEXT,
+                status_code INTEGER,
+                is_streaming INTEGER NOT NULL DEFAULT 0,
+                request_payload_redacted TEXT,
+                upstream_request_payload_redacted TEXT,
+                response_payload_redacted TEXT,
+                hook_hit INTEGER NOT NULL DEFAULT 0,
+                hook_events_json TEXT NOT NULL DEFAULT '[]',
+                redaction_applied INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                retention_until INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_proxy_interactions_created
+                ON proxy_interactions(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_proxy_interactions_filters
+                ON proxy_interactions(app_type, client_model, final_provider_id, status_code);
+            CREATE TABLE IF NOT EXISTS proxy_interaction_attempts (
+                request_id TEXT NOT NULL,
+                attempt_index INTEGER NOT NULL,
+                provider_id TEXT NOT NULL,
+                endpoint_origin TEXT,
+                status_code INTEGER,
+                error_code TEXT,
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                PRIMARY KEY (request_id, attempt_index),
+                FOREIGN KEY (request_id) REFERENCES proxy_interactions(request_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_proxy_interaction_attempts_request
+                ON proxy_interaction_attempts(request_id, attempt_index);",
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
         // 修复跑过未发布开发版的库：current 标记曾是全局 key，现按应用分组
         // （随 v12 定稿为 current_profile_id_<scope>，不单独 bump 版本）
         if conn
@@ -563,6 +607,11 @@ impl Database {
                             }
                         }
                         Self::set_user_version(conn, 19)?;
+                    }
+                    19 => {
+                        // create_tables_on_conn runs before migrations and has
+                        // already created the v20 interaction tables.
+                        Self::set_user_version(conn, 20)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(

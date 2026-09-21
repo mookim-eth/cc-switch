@@ -8,6 +8,107 @@ use crate::proxy::{CircuitBreakerConfig, CircuitBreakerStats};
 use crate::store::AppState;
 use std::str::FromStr;
 
+/// Return local-control status without exposing the bearer token.
+#[tauri::command]
+pub fn get_local_control_config(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::proxy::control::LocalControlConfig, String> {
+    crate::proxy::control::get_local_control_config(&state)
+}
+
+/// Enable/disable the local control API. On first enable, returns the newly
+/// generated token exactly once; subsequent enables return `null`.
+#[tauri::command]
+pub fn set_local_control_enabled(
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<Option<String>, String> {
+    crate::proxy::control::set_local_control_enabled(&state, enabled)
+}
+
+/// Rotate the bearer token. The previous token becomes invalid immediately.
+#[tauri::command]
+pub fn rotate_local_control_token(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    crate::proxy::control::rotate_local_control_token(&state)
+}
+
+#[tauri::command]
+pub fn set_local_control_allow_http_loopback(
+    state: tauri::State<'_, AppState>,
+    allowed: bool,
+) -> Result<(), String> {
+    crate::proxy::control::set_allow_http_loopback(&state, allowed)
+}
+
+#[tauri::command]
+pub fn get_proxy_hook_config(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::proxy::hooks::HookConfig, String> {
+    crate::proxy::hooks::get_config(state.db.as_ref())
+}
+
+#[tauri::command]
+pub fn save_proxy_hook_config(
+    state: tauri::State<'_, AppState>,
+    config: crate::proxy::hooks::HookConfig,
+) -> Result<(), String> {
+    crate::proxy::hooks::save_config(state.db.as_ref(), config)
+}
+
+#[tauri::command]
+pub fn get_proxy_interaction_recording_config(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::proxy::interactions::InteractionRecordingConfig, String> {
+    crate::proxy::interactions::get_config(state.db.as_ref())
+}
+
+#[tauri::command]
+pub fn save_proxy_interaction_recording_config(
+    state: tauri::State<'_, AppState>,
+    config: crate::proxy::interactions::InteractionRecordingConfig,
+) -> Result<(), String> {
+    crate::proxy::interactions::save_config(state.db.as_ref(), config)
+}
+
+#[tauri::command]
+pub fn list_proxy_interactions(
+    state: tauri::State<'_, AppState>,
+    filters: crate::database::ProxyInteractionFilters,
+    page: u32,
+    page_size: u32,
+) -> Result<Vec<crate::database::ProxyInteractionSummary>, String> {
+    state
+        .db
+        .list_proxy_interactions(&filters, page, page_size)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn get_proxy_interaction(
+    state: tauri::State<'_, AppState>,
+    request_id: String,
+    confirmed: bool,
+) -> Result<Option<crate::database::ProxyInteractionDetail>, String> {
+    if !confirmed {
+        return Err("查看交互正文前需要确认".to_string());
+    }
+    state
+        .db
+        .get_proxy_interaction(&request_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn list_proxy_interaction_attempts(
+    state: tauri::State<'_, AppState>,
+    request_id: String,
+) -> Result<Vec<crate::database::ProxyInteractionAttempt>, String> {
+    state
+        .db
+        .list_proxy_interaction_attempts(&request_id)
+        .map_err(|error| error.to_string())
+}
+
 fn require_proxy_app(app_type: &str) -> Result<crate::app_config::AppType, String> {
     let app = crate::app_config::AppType::from_str(app_type)
         .map_err(|error| format!("无效的应用类型: {error}"))?;

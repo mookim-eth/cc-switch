@@ -7,6 +7,7 @@ license = "MIT"
 repository = "https://github.com/farion1231/cc-switch"
 edition = "2021"
 rust-version = "1.85.0"
+default-run = "cc-switch"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -44,7 +45,7 @@ arboard = "3.6"
 flate2 = "1"
 brotli = "7"
 zstd = "0.13"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "signal"] }
 futures = "0.3"
 async-stream = "0.3"
 bytes = "1.5"
@@ -79,6 +80,7 @@ rust_decimal = "1.33"
 uuid = { version = "1.11", features = ["v4"] }
 sha2 = "0.10"
 hmac = "0.12"
+rand = "0.8"
 json5 = "0.4"
 json-five = "0.3.1"
 sys-locale = "0.3"

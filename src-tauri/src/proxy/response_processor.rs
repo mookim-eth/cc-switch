@@ -155,6 +155,15 @@ pub async fn handle_streaming(
     parser_config: &UsageParserConfig,
     connection_guard: Option<ActiveConnectionGuard>,
 ) -> Response {
+    let hooks_enabled = super::hooks::get_config(state.db.as_ref())
+        .map(|config| config.enabled)
+        .unwrap_or(false);
+    if hooks_enabled {
+        return match handle_hooked_streaming(response, ctx, state, connection_guard).await {
+            Ok(response) => response,
+            Err(error) => error.into_response(),
+        };
+    }
     let status = response.status();
     log::debug!(
         "[{}] 已接收上游流式响应: status={}, headers={}",
@@ -186,6 +195,7 @@ pub async fn handle_streaming(
 
     // 创建使用量收集器；关闭 usage logging 时不要在流式热路径上解析每个 SSE event。
     let usage_collector = create_usage_collector(ctx, state, status.as_u16(), parser_config);
+    let interaction_collector = create_interaction_collector(ctx, state, status.as_u16());
 
     // 获取流式超时配置
     let timeout_config = ctx.streaming_timeout_config();
@@ -197,6 +207,7 @@ pub async fn handle_streaming(
         usage_collector,
         timeout_config,
         connection_guard,
+        interaction_collector,
     );
 
     let body = axum::body::Body::from_stream(logged_stream);
@@ -207,6 +218,79 @@ pub async fn handle_streaming(
             ProxyError::Internal(format!("Failed to build streaming response: {e}")).into_response()
         }
     }
+}
+
+/// Security mode for streamed responses. The complete SSE response is held in
+/// memory (under the normal response-size limit), tool calls are assembled from
+/// complete JSON events, and no tool-call fragment can reach the client before
+/// the hook decision. The original streaming path remains zero-buffer when
+/// hooks are disabled (the default).
+async fn handle_hooked_streaming(
+    response: ProxyResponse,
+    ctx: &RequestContext,
+    state: &ProxyState,
+    _connection_guard: Option<ActiveConnectionGuard>,
+) -> Result<Response, ProxyError> {
+    let timeout = if ctx.app_config.streaming_idle_timeout > 0 {
+        Duration::from_secs(ctx.app_config.streaming_idle_timeout as u64)
+    } else {
+        Duration::ZERO
+    };
+    let (mut headers, status, bytes) = read_decoded_body(response, ctx.tag, timeout).await?;
+    strip_hop_by_hop_response_headers(&mut headers);
+    strip_entity_headers_for_rebuilt_body(&mut headers);
+
+    let text = String::from_utf8_lossy(&bytes);
+    let mut events = Vec::new();
+    let mut had_done = false;
+    for block in text.split("\n\n") {
+        for line in block.lines() {
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data == "[DONE]" {
+                had_done = true;
+            } else if let Ok(value) = serde_json::from_str::<Value>(data) {
+                events.push(value);
+            }
+        }
+    }
+    let hooked = super::hooks::apply_response_hooks(
+        state.db.clone(),
+        &ctx.request_id,
+        ctx.app_type_str,
+        &ctx.request_model,
+        ctx.outbound_model.as_deref(),
+        &ctx.provider.id,
+        Value::Array(events),
+    )
+    .await?;
+    let values = hooked.as_array().ok_or_else(|| {
+        ProxyError::InvalidRequest("Streaming hook replacement must be an event array".to_string())
+    })?;
+    let rebuilt = encode_sse_events(values, had_done)?;
+
+    super::interactions::complete(
+        state.db.clone(),
+        &ctx.request_id,
+        ctx.app_type_str,
+        &ctx.request_model,
+        ctx.outbound_model.as_deref(),
+        &ctx.provider,
+        status.as_u16(),
+        true,
+        None,
+        Some(&hooked),
+    );
+
+    let mut builder = axum::response::Response::builder().status(status);
+    for (key, value) in &headers {
+        builder = builder.header(key, value);
+    }
+    builder
+        .body(axum::body::Body::from(rebuilt))
+        .map_err(|error| ProxyError::Internal(error.to_string()))
 }
 
 /// 处理非流式响应
@@ -225,7 +309,7 @@ pub async fn handle_non_streaming(
         } else {
             Duration::ZERO
         };
-    let (mut response_headers, status, body_bytes) =
+    let (mut response_headers, status, mut body_bytes) =
         read_decoded_body(response, ctx.tag, body_timeout).await?;
     strip_hop_by_hop_response_headers(&mut response_headers);
 
@@ -307,6 +391,49 @@ pub async fn handle_non_streaming(
         log::debug!("[{}] usage logging 已关闭，跳过非流式 usage 解析", ctx.tag);
     }
 
+    // Hooks operate on a complete parsed response before any bytes are exposed
+    // to the client. Non-JSON payloads remain byte-identical and are recorded
+    // as metadata only.
+    let mut response_json = serde_json::from_slice::<Value>(&body_bytes).ok();
+    let hooks_enabled = super::hooks::get_config(state.db.as_ref())
+        .map(|config| config.enabled)
+        .unwrap_or(false);
+    if hooks_enabled {
+        if let Some(payload) = response_json.take() {
+            let hooked = super::hooks::apply_response_hooks(
+                state.db.clone(),
+                &ctx.request_id,
+                ctx.app_type_str,
+                &ctx.request_model,
+                ctx.outbound_model.as_deref(),
+                &ctx.provider.id,
+                payload,
+            )
+            .await?;
+            body_bytes = Bytes::from(
+                serde_json::to_vec(&hooked)
+                    .map_err(|error| ProxyError::Internal(error.to_string()))?,
+            );
+            strip_entity_headers_for_rebuilt_body(&mut response_headers);
+            response_json = Some(hooked);
+        }
+    } else if response_json.is_none() {
+        // Keep the parse result explicit for the interaction recorder below.
+    }
+
+    super::interactions::complete(
+        state.db.clone(),
+        &ctx.request_id,
+        ctx.app_type_str,
+        &ctx.request_model,
+        ctx.outbound_model.as_deref(),
+        &ctx.provider,
+        status.as_u16(),
+        false,
+        None,
+        response_json.as_ref(),
+    );
+
     // 构建响应
     let mut builder = axum::response::Response::builder().status(status);
     for (key, value) in response_headers.iter() {
@@ -347,6 +474,211 @@ type UsageCallbackWithTiming = Arc<dyn Fn(Vec<Value>, Option<u64>) + Send + Sync
 #[derive(Clone)]
 pub struct SseUsageCollector {
     inner: Arc<SseUsageCollectorInner>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SseInteractionCollector {
+    db: Arc<crate::database::Database>,
+    request_id: String,
+    app: String,
+    client_model: String,
+    outbound_model: Option<String>,
+    provider: crate::provider::Provider,
+    status_code: u16,
+    max_body_bytes: usize,
+    record_raw_sse: bool,
+    record_body: bool,
+    hooks_enabled: bool,
+    events: Arc<Mutex<Vec<Value>>>,
+    estimated_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    finished: Arc<AtomicBool>,
+    saw_done: Arc<AtomicBool>,
+}
+
+impl SseInteractionCollector {
+    async fn push(&self, event: Value) {
+        let bytes = serde_json::to_vec(&event)
+            .map(|value| value.len())
+            .unwrap_or(0);
+        let previous = self
+            .estimated_bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        if previous.saturating_add(bytes) <= self.max_body_bytes {
+            self.events.lock().await.push(event);
+        }
+    }
+
+    fn mark_done(&self) {
+        self.saw_done.store(true, Ordering::Release);
+    }
+
+    async fn finish(&self) {
+        if self.finished.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let events = std::mem::take(&mut *self.events.lock().await);
+        if !self.record_body {
+            return;
+        }
+        let response = if self.record_raw_sse {
+            let sensitive = super::hooks::get_config(self.db.as_ref())
+                .map(|config| config.sensitive_strings)
+                .unwrap_or_default();
+            let redacted = events
+                .into_iter()
+                .map(|event| super::hooks::redact_value(&event, &sensitive))
+                .collect::<Vec<_>>();
+            Value::String(
+                String::from_utf8(
+                    encode_sse_events(&redacted, self.saw_done.load(Ordering::Acquire))
+                        .unwrap_or_default(),
+                )
+                .unwrap_or_default(),
+            )
+        } else {
+            Value::Array(events)
+        };
+        super::interactions::complete(
+            self.db.clone(),
+            &self.request_id,
+            &self.app,
+            &self.client_model,
+            self.outbound_model.as_deref(),
+            &self.provider,
+            self.status_code,
+            true,
+            None,
+            Some(&response),
+        );
+    }
+
+    async fn apply_hooks(&self, original: Vec<Value>) -> Result<Vec<Value>, ProxyError> {
+        let hooked = super::hooks::apply_response_hooks(
+            self.db.clone(),
+            &self.request_id,
+            &self.app,
+            &self.client_model,
+            self.outbound_model.as_deref(),
+            &self.provider.id,
+            Value::Array(original),
+        )
+        .await?;
+        hooked.as_array().cloned().ok_or_else(|| {
+            ProxyError::InvalidRequest(
+                "Streaming hook replacement must be an event array".to_string(),
+            )
+        })
+    }
+}
+
+struct SseInteractionFinishGuard(Option<SseInteractionCollector>);
+
+impl Drop for SseInteractionFinishGuard {
+    fn drop(&mut self) {
+        let Some(collector) = self.0.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                collector.finish().await;
+            });
+        }
+    }
+}
+
+pub(crate) fn create_interaction_collector(
+    ctx: &RequestContext,
+    state: &ProxyState,
+    status_code: u16,
+) -> Option<SseInteractionCollector> {
+    // Streaming bodies may never be polled to completion (client disconnect,
+    // transport cancellation). Persist the final route metadata before the
+    // response is handed to Axum; a body collector will fill in the optional
+    // response payload when the stream finishes.
+    super::interactions::complete(
+        state.db.clone(),
+        &ctx.request_id,
+        ctx.app_type_str,
+        &ctx.request_model,
+        ctx.outbound_model.as_deref(),
+        &ctx.provider,
+        status_code,
+        true,
+        None,
+        None,
+    );
+    let config = super::interactions::get_config(state.db.as_ref()).ok()?;
+    let record_body = super::interactions::should_record_body(
+        &config,
+        ctx.app_type_str,
+        &ctx.request_model,
+        &ctx.provider.id,
+    );
+    let hooks_enabled = super::hooks::get_config(state.db.as_ref())
+        .map(|config| config.enabled)
+        .unwrap_or(false);
+    if !record_body && !hooks_enabled {
+        return None;
+    }
+    Some(SseInteractionCollector {
+        db: state.db.clone(),
+        request_id: ctx.request_id.clone(),
+        app: ctx.app_type_str.to_string(),
+        client_model: ctx.request_model.clone(),
+        outbound_model: ctx.outbound_model.clone(),
+        provider: ctx.provider.clone(),
+        status_code,
+        max_body_bytes: if hooks_enabled {
+            MAX_RESPONSE_BODY_BYTES
+        } else {
+            config.max_body_bytes
+        },
+        record_raw_sse: config.record_raw_sse,
+        record_body,
+        hooks_enabled,
+        events: Arc::new(Mutex::new(Vec::new())),
+        estimated_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        finished: Arc::new(AtomicBool::new(false)),
+        saw_done: Arc::new(AtomicBool::new(false)),
+    })
+}
+
+/// Apply response/tool hooks to a converted JSON response and persist the
+/// interaction exactly as the generic non-streaming path does.
+pub(crate) async fn finalize_json_response(
+    mut response: Value,
+    ctx: &RequestContext,
+    state: &ProxyState,
+    status_code: u16,
+) -> Result<Value, ProxyError> {
+    let hooks_enabled = super::hooks::get_config(state.db.as_ref())
+        .map(|config| config.enabled)
+        .unwrap_or(false);
+    if hooks_enabled {
+        response = super::hooks::apply_response_hooks(
+            state.db.clone(),
+            &ctx.request_id,
+            ctx.app_type_str,
+            &ctx.request_model,
+            ctx.outbound_model.as_deref(),
+            &ctx.provider.id,
+            response,
+        )
+        .await?;
+    }
+    super::interactions::complete(
+        state.db.clone(),
+        &ctx.request_id,
+        ctx.app_type_str,
+        &ctx.request_model,
+        ctx.outbound_model.as_deref(),
+        &ctx.provider,
+        status_code,
+        false,
+        None,
+        Some(&response),
+    );
+    Ok(response)
 }
 
 struct SseUsageCollectorInner {
@@ -679,22 +1011,153 @@ async fn log_usage_internal(
     }
 }
 
+fn encode_sse_events(values: &[Value], had_done: bool) -> Result<Vec<u8>, ProxyError> {
+    let mut rebuilt = Vec::new();
+    for value in values {
+        if let Some(kind) = value.get("type").and_then(Value::as_str).filter(|kind| {
+            kind.starts_with("message_")
+                || kind.starts_with("content_block_")
+                || kind.starts_with("response.")
+                || matches!(*kind, "ping" | "error")
+        }) {
+            rebuilt.extend_from_slice(b"event: ");
+            rebuilt.extend_from_slice(kind.as_bytes());
+            rebuilt.push(b'\n');
+        }
+        rebuilt.extend_from_slice(b"data: ");
+        rebuilt.extend_from_slice(
+            &serde_json::to_vec(value).map_err(|error| ProxyError::Internal(error.to_string()))?,
+        );
+        rebuilt.extend_from_slice(b"\n\n");
+    }
+    if had_done {
+        rebuilt.extend_from_slice(b"data: [DONE]\n\n");
+    }
+    Ok(rebuilt)
+}
+
+#[derive(Clone, Copy, Default)]
+struct StreamToolBoundary {
+    starts: bool,
+    ends: bool,
+}
+
+fn contains_named_key(value: &Value, names: &[&str]) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            names.iter().any(|name| key.eq_ignore_ascii_case(name))
+                || contains_named_key(value, names)
+        }),
+        Value::Array(values) => values.iter().any(|value| contains_named_key(value, names)),
+        _ => false,
+    }
+}
+
+/// Identify protocol-level tool-call boundaries without interpreting policy.
+/// Text events are not buffered. Known multi-event tool protocols are held
+/// from their start marker through the corresponding completion marker.
+fn stream_tool_boundary(value: &Value, already_buffering: bool) -> StreamToolBoundary {
+    let kind = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if kind == "content_block_start"
+        && value.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use")
+    {
+        return StreamToolBoundary {
+            starts: true,
+            ends: false,
+        };
+    }
+    if already_buffering && kind == "content_block_stop" {
+        return StreamToolBoundary {
+            starts: false,
+            ends: true,
+        };
+    }
+    if kind == "response.output_item.added"
+        && value.pointer("/item/type").and_then(Value::as_str) == Some("function_call")
+    {
+        return StreamToolBoundary {
+            starts: true,
+            ends: false,
+        };
+    }
+    if already_buffering
+        && kind == "response.output_item.done"
+        && value.pointer("/item/type").and_then(Value::as_str) == Some("function_call")
+    {
+        return StreamToolBoundary {
+            starts: false,
+            ends: true,
+        };
+    }
+
+    let chat_has_tool_delta =
+        value
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(|choices| {
+                choices.iter().any(|choice| {
+                    choice
+                        .pointer("/delta/tool_calls")
+                        .and_then(Value::as_array)
+                        .is_some_and(|calls| !calls.is_empty())
+                })
+            });
+    let chat_tool_finished =
+        value
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(|choices| {
+                choices.iter().any(|choice| {
+                    matches!(
+                        choice.get("finish_reason").and_then(Value::as_str),
+                        Some("tool_calls" | "function_call")
+                    )
+                })
+            });
+    if chat_has_tool_delta || (already_buffering && chat_tool_finished) {
+        return StreamToolBoundary {
+            starts: chat_has_tool_delta && !already_buffering,
+            ends: chat_tool_finished,
+        };
+    }
+
+    // Gemini emits complete functionCall parts in a single event.
+    if !already_buffering && contains_named_key(value, &["functionCall", "function_call"]) {
+        return StreamToolBoundary {
+            starts: true,
+            ends: true,
+        };
+    }
+    StreamToolBoundary::default()
+}
+
 /// 创建带日志记录和超时控制的透传流
-pub fn create_logged_passthrough_stream(
+pub(crate) fn create_logged_passthrough_stream(
     stream: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
     tag: &'static str,
     usage_collector: Option<SseUsageCollector>,
     timeout_config: StreamingTimeoutConfig,
     connection_guard: Option<ActiveConnectionGuard>,
+    interaction_collector: Option<SseInteractionCollector>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let _conn_guard = connection_guard;
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
         let mut collector = usage_collector;
+        let interaction_collector = interaction_collector;
+        let hooks_enabled = interaction_collector
+            .as_ref()
+            .is_some_and(|collector| collector.hooks_enabled);
+        let mut buffered_tool_events = Vec::<Value>::new();
+        let mut interaction_finish_guard =
+            interaction_collector.clone().map(|collector| SseInteractionFinishGuard(Some(collector)));
         let mut finish_guard = collector.clone().map(SseUsageFinishGuard::new);
         let inspect_sse_events =
-            collector.is_some() || log::log_enabled!(log::Level::Debug);
+            collector.is_some() || interaction_collector.is_some() || log::log_enabled!(log::Level::Debug);
         let mut is_first_chunk = true;
 
         // 超时配置
@@ -750,20 +1213,18 @@ pub fn create_logged_passthrough_stream(
 
                         // 尝试解析并记录完整的 SSE 事件
                         while let Some(event_text) = take_sse_block(&mut buffer) {
+                            let mut had_data_field = false;
                             if !event_text.trim().is_empty() {
                                 // 提取 data 部分；只有 usage collector 存在时才解析 JSON。
                                 for line in event_text.lines() {
                                     if let Some(data) = strip_sse_field(line, "data") {
+                                        had_data_field = true;
                                         if data.trim() != "[DONE]" {
-                                            let collected = match &collector {
-                                                Some(c) if c.should_collect(data) => {
-                                                    match serde_json::from_str::<Value>(data) {
-                                                        Ok(json_value) => {
-                                                            c.push(json_value).await;
-                                                            true
-                                                        }
-                                                        Err(_) => false,
-                                                    }
+                                            let parsed = serde_json::from_str::<Value>(data).ok();
+                                            let collected = match (&collector, parsed.as_ref()) {
+                                                (Some(c), Some(json_value)) if c.should_collect(data) => {
+                                                    c.push(json_value.clone()).await;
+                                                    true
                                                 }
                                                 _ => false,
                                             };
@@ -771,16 +1232,103 @@ pub fn create_logged_passthrough_stream(
                                                 "[{tag}] <<< SSE data: bytes={}, usage_collected={collected} (content omitted)",
                                                 data.len()
                                             );
+
+                                            if hooks_enabled {
+                                                if let (Some(interaction), Some(json_value)) =
+                                                    (&interaction_collector, parsed)
+                                                {
+                                                    let boundary = stream_tool_boundary(
+                                                        &json_value,
+                                                        !buffered_tool_events.is_empty(),
+                                                    );
+                                                    if boundary.starts
+                                                        || !buffered_tool_events.is_empty()
+                                                    {
+                                                        buffered_tool_events.push(json_value);
+                                                        if boundary.ends {
+                                                            match interaction
+                                                                .apply_hooks(std::mem::take(
+                                                                    &mut buffered_tool_events,
+                                                                ))
+                                                                .await
+                                                            {
+                                                                Ok(values) => {
+                                                                    for value in &values {
+                                                                        interaction
+                                                                            .push(value.clone())
+                                                                            .await;
+                                                                    }
+                                                                    match encode_sse_events(
+                                                                        &values, false,
+                                                                    ) {
+                                                                        Ok(bytes) => {
+                                                                            yield Ok(Bytes::from(bytes));
+                                                                        }
+                                                                        Err(error) => {
+                                                                            yield Err(std::io::Error::other(error.to_string()));
+                                                                            return;
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Err(error) => {
+                                                                    yield Err(std::io::Error::other(error.to_string()));
+                                                                    return;
+                                                                }
+                                                            }
+                                                        }
+                                                    } else {
+                                                        match interaction.apply_hooks(vec![json_value]).await {
+                                                            Ok(values) => {
+                                                                for value in &values {
+                                                                    interaction.push(value.clone()).await;
+                                                                }
+                                                                match encode_sse_events(&values, false) {
+                                                                    Ok(bytes) => yield Ok(Bytes::from(bytes)),
+                                                                    Err(error) => {
+                                                                        yield Err(std::io::Error::other(error.to_string()));
+                                                                        return;
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(error) => {
+                                                                yield Err(std::io::Error::other(error.to_string()));
+                                                                return;
+                                                            }
+                                                        }
+                                                    }
+                                                } else {
+                                                    let mut raw = event_text.clone();
+                                                    raw.push_str("\n\n");
+                                                    yield Ok(Bytes::from(raw));
+                                                }
+                                            } else if let (Some(interaction), Some(json_value)) =
+                                                (&interaction_collector, parsed)
+                                            {
+                                                interaction.push(json_value).await;
+                                            }
                                         } else {
+                                            if let Some(interaction) = &interaction_collector {
+                                                interaction.mark_done();
+                                            }
                                             log::debug!("[{tag}] <<< SSE: [DONE]");
+                                            if hooks_enabled {
+                                                yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
+                                            }
                                         }
                                     }
                                 }
                             }
+                            if hooks_enabled && !had_data_field {
+                                let mut raw = event_text;
+                                raw.push_str("\n\n");
+                                yield Ok(Bytes::from(raw));
+                            }
                         }
                     }
 
-                    yield Ok(bytes);
+                    if !hooks_enabled {
+                        yield Ok(bytes);
+                    }
                 }
                 Some(Err(e)) => {
                     log::error!("[{tag}] 流错误: {e}");
@@ -799,6 +1347,19 @@ pub fn create_logged_passthrough_stream(
         }
         if let Some(guard) = &mut finish_guard {
             guard.disarm();
+        }
+        if let Some(interaction) = interaction_collector {
+            if hooks_enabled && !buffered_tool_events.is_empty() {
+                // An incomplete call cannot be inspected safely and must never
+                // leak partial arguments to the client.
+                yield Err(std::io::Error::other(
+                    "upstream ended during a tool call",
+                ));
+            }
+            interaction.finish().await;
+        }
+        if let Some(guard) = &mut interaction_finish_guard {
+            guard.0 = None;
         }
     }
 }
@@ -1029,7 +1590,8 @@ mod tests {
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
             app_handle: None,
-            failover_manager: Arc::new(FailoverSwitchManager::new(db)),
+            failover_manager: Arc::new(FailoverSwitchManager::new(db.clone())),
+            control_state: crate::store::AppState::new(db),
         }
     }
 
@@ -1280,4 +1842,45 @@ mod tests {
         );
         Ok(())
     }
+}
+#[test]
+fn rebuilt_sse_preserves_protocol_event_names_and_done_semantics() {
+    let claude = encode_sse_events(
+        &[serde_json::json!({"type":"content_block_start", "index":0})],
+        false,
+    )
+    .unwrap();
+    let claude = String::from_utf8(claude).unwrap();
+    assert!(claude.starts_with("event: content_block_start\ndata: "));
+    assert!(!claude.contains("[DONE]"));
+
+    let openai = encode_sse_events(&[serde_json::json!({"id":"chunk"})], true).unwrap();
+    let openai = String::from_utf8(openai).unwrap();
+    assert!(openai.starts_with("data: "));
+    assert!(openai.ends_with("data: [DONE]\n\n"));
+}
+
+#[test]
+fn stream_tool_boundaries_withhold_only_complete_tool_sequences() {
+    let text = serde_json::json!({
+        "type": "content_block_delta",
+        "delta": {"type": "text_delta", "text": "hello"}
+    });
+    assert!(!stream_tool_boundary(&text, false).starts);
+
+    let start = serde_json::json!({
+        "type": "content_block_start",
+        "index": 1,
+        "content_block": {"type": "tool_use", "name": "read_file", "input": {}}
+    });
+    let stop = serde_json::json!({"type": "content_block_stop", "index": 1});
+    assert!(stream_tool_boundary(&start, false).starts);
+    assert!(!stream_tool_boundary(&start, false).ends);
+    assert!(stream_tool_boundary(&stop, true).ends);
+
+    let gemini = serde_json::json!({
+        "candidates": [{"content": {"parts": [{"functionCall": {"name": "read_file", "args": {"path": "a"}}}]}}]
+    });
+    let boundary = stream_tool_boundary(&gemini, false);
+    assert!(boundary.starts && boundary.ends);
 }

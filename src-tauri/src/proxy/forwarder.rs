@@ -156,6 +156,7 @@ impl Drop for ActiveConnectionGuard {
 }
 
 pub struct RequestForwarder {
+    db: Arc<crate::database::Database>,
     /// 共享的 ProviderRouter（持有熔断器状态）
     router: Arc<ProviderRouter>,
     status: Arc<RwLock<ProxyStatus>>,
@@ -188,9 +189,20 @@ pub struct RequestForwarder {
     /// `max_attempts = max_retries + 1`，所以 max_retries=0 表示仅尝试一家、
     /// max_retries=3（默认）表示最多 4 家。loop 同时受 providers.len() 自然限制。
     max_attempts: usize,
+    request_id: String,
+    client_model: String,
 }
 
 impl RequestForwarder {
+    fn log_final_route(&self, app: &str, provider: &Provider, outbound_model: Option<&str>) {
+        log::info!(
+            "Route finalized: app={app}, client_model={}, outbound_model={}, provider={}",
+            self.client_model,
+            outbound_model.unwrap_or("unknown"),
+            provider.id
+        );
+    }
+
     /// 预防式 media 降级：发送前对 text-only 模型把图片块替换为标记。
     ///
     /// 受 `enabled && request_media_fallback` 管辖；其中"启发式模型名单预测"
@@ -238,6 +250,7 @@ impl RequestForwarder {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        db: Arc<crate::database::Database>,
         router: Arc<ProviderRouter>,
         non_streaming_timeout: u64,
         status: Arc<RwLock<ProxyStatus>>,
@@ -255,11 +268,14 @@ impl RequestForwarder {
         optimizer_config: OptimizerConfig,
         copilot_optimizer_config: CopilotOptimizerConfig,
         max_retries: u32,
+        request_id: String,
+        client_model: String,
     ) -> Self {
         // max_retries 是「失败后重试次数」语义，attempt 上限 = retries + 1。
         // saturating_add 防止 u32::MAX + 1 溢出。
         let max_attempts = (max_retries as usize).saturating_add(1);
         Self {
+            db,
             router,
             status,
             current_providers,
@@ -278,6 +294,8 @@ impl RequestForwarder {
                 streaming_first_byte_timeout,
             ),
             max_attempts,
+            request_id,
+            client_model,
         }
     }
 
@@ -512,6 +530,12 @@ impl RequestForwarder {
                 };
 
             attempted_providers += 1;
+            let attempt_index = attempted_providers as i64;
+            let attempt_started_at = chrono::Utc::now().timestamp_millis();
+            let endpoint_origin = adapter
+                .extract_base_url(provider)
+                .ok()
+                .and_then(|value| sanitized_origin(&value));
 
             // 更新状态中的当前 Provider 信息（per-attempt 维度的标识）
             //
@@ -539,6 +563,19 @@ impl RequestForwarder {
                 .await
             {
                 Ok((response, claude_api_format, outbound_model)) => {
+                    let attempt = crate::database::ProxyInteractionAttempt {
+                        request_id: self.request_id.clone(),
+                        attempt_index,
+                        provider_id: provider.id.clone(),
+                        endpoint_origin: endpoint_origin.clone(),
+                        status_code: Some(i64::from(response.status().as_u16())),
+                        error_code: None,
+                        started_at: attempt_started_at,
+                        completed_at: Some(chrono::Utc::now().timestamp_millis()),
+                    };
+                    if let Err(error) = self.db.record_proxy_interaction_attempt(&attempt) {
+                        log::warn!("[Interactions] attempt write failed: {error}");
+                    }
                     // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
                     // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
                     self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
@@ -582,6 +619,7 @@ impl RequestForwarder {
                         }
                     }
 
+                    self.log_final_route(app_type_str, provider, outbound_model.as_deref());
                     return Ok(ForwardResult {
                         response,
                         provider: provider.clone(),
@@ -591,6 +629,19 @@ impl RequestForwarder {
                     });
                 }
                 Err(e) => {
+                    let attempt = crate::database::ProxyInteractionAttempt {
+                        request_id: self.request_id.clone(),
+                        attempt_index,
+                        provider_id: provider.id.clone(),
+                        endpoint_origin: endpoint_origin.clone(),
+                        status_code: proxy_error_status(&e).map(i64::from),
+                        error_code: Some(proxy_error_code(&e).to_string()),
+                        started_at: attempt_started_at,
+                        completed_at: Some(chrono::Utc::now().timestamp_millis()),
+                    };
+                    if let Err(error) = self.db.record_proxy_interaction_attempt(&attempt) {
+                        log::warn!("[Interactions] attempt write failed: {error}");
+                    }
                     // 检测是否需要触发整流器（仅 Claude/ClaudeAuth 供应商）
                     let provider_type = ProviderType::from_app_type_and_config(app_type, provider);
                     let is_anthropic_provider = matches!(
@@ -685,6 +736,11 @@ impl RequestForwarder {
                                         }
                                     }
 
+                                    self.log_final_route(
+                                        app_type_str,
+                                        provider,
+                                        outbound_model.as_deref(),
+                                    );
                                     return Ok(ForwardResult {
                                         response,
                                         provider: provider.clone(),
@@ -834,6 +890,11 @@ impl RequestForwarder {
                                             }
                                         }
 
+                                        self.log_final_route(
+                                            app_type_str,
+                                            provider,
+                                            outbound_model.as_deref(),
+                                        );
                                         return Ok(ForwardResult {
                                             response,
                                             provider: provider.clone(),
@@ -994,6 +1055,11 @@ impl RequestForwarder {
                                         }
                                     }
 
+                                    self.log_final_route(
+                                        app_type_str,
+                                        provider,
+                                        outbound_model.as_deref(),
+                                    );
                                     return Ok(ForwardResult {
                                         response,
                                         provider: provider.clone(),
@@ -1698,6 +1764,89 @@ impl RequestForwarder {
                 }
             }
         }
+
+        // The request hook sees the final protocol-specific body but never
+        // receives proxy/upstream credentials. A replacement is run through
+        // the private-field filter again before it can leave the process.
+        let hook_input = super::hooks::HookInput {
+            request_id: &self.request_id,
+            phase: super::hooks::HookPhase::BeforeRequest,
+            app: app_type.as_str(),
+            client_model: &self.client_model,
+            outbound_model: outbound_model.as_deref(),
+            provider_id: &provider.id,
+            payload: filtered_body.clone(),
+        };
+        match super::hooks::invoke(self.db.clone(), hook_input)
+            .await
+            .or_else(|failure| {
+                super::hooks::resolve_failure(
+                    self.db.as_ref(),
+                    &self.request_id,
+                    "before_request",
+                    failure,
+                )
+            })? {
+            super::hooks::HookDecision::Allow => {}
+            super::hooks::HookDecision::Block { reason, rule_id } => {
+                super::hooks::record_event(
+                    self.db.as_ref(),
+                    &self.request_id,
+                    "before_request",
+                    "block",
+                    rule_id.as_deref(),
+                    Some(&reason),
+                );
+                log::warn!(
+                    "[Hook] request blocked request_id={} rule_id={}",
+                    self.request_id,
+                    rule_id.as_deref().unwrap_or("unspecified")
+                );
+                return Err(ProxyError::InvalidRequest(format!(
+                    "Request blocked by local policy: {reason}"
+                )));
+            }
+            super::hooks::HookDecision::Replace { payload, rule_id } => {
+                filtered_body = prepare_upstream_request_body(payload);
+                super::hooks::record_event(
+                    self.db.as_ref(),
+                    &self.request_id,
+                    "before_request",
+                    "replace",
+                    rule_id.as_deref(),
+                    None,
+                );
+                log::info!(
+                    "[Hook] request replaced request_id={} rule_id={}",
+                    self.request_id,
+                    rule_id.as_deref().unwrap_or("unspecified")
+                );
+            }
+            super::hooks::HookDecision::Audit { event, rule_id } => {
+                super::hooks::record_event(
+                    self.db.as_ref(),
+                    &self.request_id,
+                    "before_request",
+                    "audit",
+                    rule_id.as_deref(),
+                    Some(&event),
+                );
+                log::info!(
+                    "[Hook] audit request_id={} rule_id={} event={}",
+                    self.request_id,
+                    rule_id.as_deref().unwrap_or("unspecified"),
+                    event
+                );
+            }
+        }
+        super::interactions::record_upstream_request(
+            self.db.as_ref(),
+            &self.request_id,
+            app_type.as_str(),
+            &self.client_model,
+            &provider.id,
+            &filtered_body,
+        );
         // 出站 body 定稿后刷新真值（覆盖 Codex chat 上游模型覆写、转换层模型改写）
         if let Some(m) = filtered_body
             .get("model")
@@ -3554,6 +3703,38 @@ fn is_streaming_request(endpoint: &str, body: &Value, headers: &axum::http::Head
         .unwrap_or(false)
 }
 
+fn sanitized_origin(value: &str) -> Option<String> {
+    let parsed = url::Url::parse(value).ok()?;
+    parsed.host_str()?;
+    Some(parsed.origin().ascii_serialization())
+}
+
+fn proxy_error_status(error: &ProxyError) -> Option<u16> {
+    match error {
+        ProxyError::UpstreamError { status, .. } => Some(*status),
+        ProxyError::Timeout(_) | ProxyError::StreamIdleTimeout(_) => Some(504),
+        ProxyError::AuthError(_) => Some(401),
+        ProxyError::InvalidRequest(_) | ProxyError::ConfigError(_) => Some(400),
+        ProxyError::ResponseBodyTooLarge(_) | ProxyError::ForwardFailed(_) => Some(502),
+        _ => None,
+    }
+}
+
+fn proxy_error_code(error: &ProxyError) -> &'static str {
+    match error {
+        ProxyError::UpstreamError { .. } => "upstream_error",
+        ProxyError::Timeout(_) | ProxyError::StreamIdleTimeout(_) => "timeout",
+        ProxyError::AuthError(_) => "auth_error",
+        ProxyError::InvalidRequest(_) => "invalid_request",
+        ProxyError::ConfigError(_) => "config_error",
+        ProxyError::ResponseBodyTooLarge(_) => "response_too_large",
+        ProxyError::ForwardFailed(_) => "forward_failed",
+        ProxyError::AllProvidersCircuitOpen => "circuit_open",
+        ProxyError::NoAvailableProvider | ProxyError::NoProvidersConfigured => "no_provider",
+        _ => "proxy_error",
+    }
+}
+
 #[cfg(test)]
 fn should_force_identity_encoding(
     endpoint: &str,
@@ -3876,6 +4057,7 @@ mod tests {
         let db = Arc::new(Database::memory().expect("memory db"));
 
         RequestForwarder {
+            db: db.clone(),
             router: Arc::new(ProviderRouter::new(db.clone())),
             status: Arc::new(RwLock::new(ProxyStatus::default())),
             current_providers: Arc::new(RwLock::new(HashMap::new())),
@@ -3892,6 +4074,8 @@ mod tests {
             non_streaming_timeout,
             streaming_first_byte_timeout,
             max_attempts: 1,
+            request_id: "test-request".to_string(),
+            client_model: "test-model".to_string(),
         }
     }
 

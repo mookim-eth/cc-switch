@@ -9,6 +9,7 @@
 //! a direct (non-proxied) CLI request.
 
 use super::{
+    control,
     failover_switch::FailoverSwitchManager,
     handlers,
     log_codes::srv as log_srv,
@@ -20,7 +21,7 @@ use super::{
 use crate::database::Database;
 use axum::{
     extract::DefaultBodyLimit,
-    routing::{any, get, post},
+    routing::{any, get, post, put},
     Router,
 };
 use hyper_util::rt::TokioIo;
@@ -48,6 +49,8 @@ pub struct ProxyState {
     pub app_handle: Option<tauri::AppHandle>,
     /// 故障转移切换管理器
     pub failover_manager: Arc<FailoverSwitchManager>,
+    /// ProviderService-compatible state for the authenticated local control API.
+    pub control_state: crate::store::AppState,
 }
 
 /// 代理HTTP服务器
@@ -60,10 +63,21 @@ pub struct ProxyServer {
 }
 
 impl ProxyServer {
+    #[allow(dead_code)]
     pub fn new(
         config: ProxyConfig,
         db: Arc<Database>,
         app_handle: Option<tauri::AppHandle>,
+    ) -> Self {
+        let control_state = crate::store::AppState::new(db.clone());
+        Self::new_with_control_state(config, db, app_handle, control_state)
+    }
+
+    pub(crate) fn new_with_control_state(
+        config: ProxyConfig,
+        db: Arc<Database>,
+        app_handle: Option<tauri::AppHandle>,
+        control_state: crate::store::AppState,
     ) -> Self {
         // 创建共享的 ProviderRouter（熔断器状态将跨所有请求保持）
         let provider_router = Arc::new(ProviderRouter::new(db.clone()));
@@ -81,6 +95,7 @@ impl ProxyServer {
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
             app_handle,
             failover_manager,
+            control_state,
         };
 
         Self {
@@ -143,7 +158,7 @@ impl ProxyServer {
             loop {
                 tokio::select! {
                     result = listener.accept() => {
-                        let (stream, _remote_addr) = match result {
+                        let (stream, remote_addr) = match result {
                             Ok(v) => v,
                             Err(e) => {
                                 log::error!("[{SRV}] accept 失败: {e}", SRV = log_srv::ACCEPT_ERR);
@@ -184,6 +199,7 @@ impl ProxyServer {
 
                                     // Insert our own header case map alongside hyper's internal one
                                     parts.extensions.insert(cases);
+                                    parts.extensions.insert(remote_addr);
 
                                     let body = axum::body::Body::new(body);
                                     let axum_req = http::Request::from_parts(parts, body);
@@ -293,6 +309,16 @@ impl ProxyServer {
             // 健康检查
             .route("/health", get(handlers::health_check))
             .route("/status", get(handlers::get_status))
+            .route(
+                "/control/v1/routes/:app",
+                put(control::apply_remote_route)
+                    .layer(DefaultBodyLimit::max(control::CONTROL_BODY_LIMIT)),
+            )
+            .route(
+                "/control/v1/model-routes/:app",
+                put(control::apply_model_routes)
+                    .layer(DefaultBodyLimit::max(control::CONTROL_BODY_LIMIT)),
+            )
             // Claude API (支持带前缀和不带前缀两种格式)
             .route("/v1/messages", post(handlers::handle_messages))
             .route("/claude/v1/messages", post(handlers::handle_messages))
