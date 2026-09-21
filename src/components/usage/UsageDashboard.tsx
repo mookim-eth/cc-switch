@@ -22,6 +22,7 @@ import {
   DatabaseBackup,
   Loader2,
   ScanSearch,
+  MessagesSquare,
 } from "lucide-react";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import {
@@ -51,6 +52,7 @@ import { Switch } from "@/components/ui/switch";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { usageApi } from "@/lib/api/usage";
 import { toast } from "sonner";
+import { ProxyInteractionsPanel } from "./ProxyInteractionsPanel";
 
 const APP_FILTER_OPTIONS: AppTypeFilter[] = ["all", ...KNOWN_APP_TYPES];
 
@@ -113,6 +115,7 @@ export function UsageDashboard({
   const [showRebuildConfirm, setShowRebuildConfirm] = useState(false);
   const [rebuildingCodex, setRebuildingCodex] = useState(false);
   const [syncingSession, setSyncingSession] = useState(false);
+  const [usageTab, setUsageTab] = useState("logs");
 
   useEffect(() => {
     setRefreshIntervalMs(normalizeRefreshInterval(savedRefreshIntervalMs));
@@ -424,7 +427,7 @@ export function UsageDashboard({
       />
 
       <div className="space-y-4">
-        <Tabs defaultValue="logs" className="w-full">
+        <Tabs value={usageTab} onValueChange={setUsageTab} className="w-full">
           <div className="flex items-center justify-between mb-4">
             <TabsList className="bg-muted/50">
               <TabsTrigger value="logs" className="gap-2">
@@ -438,6 +441,10 @@ export function UsageDashboard({
               <TabsTrigger value="models" className="gap-2">
                 <BarChart3 className="h-4 w-4" />
                 {t("usage.modelStats")}
+              </TabsTrigger>
+              <TabsTrigger value="interactions" className="gap-2">
+                <MessagesSquare className="h-4 w-4" />
+                交互审计
               </TabsTrigger>
             </TabsList>
           </div>
@@ -476,6 +483,12 @@ export function UsageDashboard({
                 providerName={providerName}
                 model={model}
                 refreshIntervalMs={refreshIntervalMs}
+              />
+            </TabsContent>
+
+            <TabsContent value="interactions" className="mt-0">
+              <ProxyInteractionsPanel
+                onOpenRequestLogs={() => setUsageTab("logs")}
               />
             </TabsContent>
           </motion.div>

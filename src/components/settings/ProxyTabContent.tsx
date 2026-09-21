@@ -1,5 +1,13 @@
 import { useState } from "react";
-import { Server, Activity, Zap, Globe, ShieldAlert } from "lucide-react";
+import {
+  Server,
+  Activity,
+  Zap,
+  Globe,
+  ShieldAlert,
+  RadioTower,
+  Webhook,
+} from "lucide-react";
 import { motion } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import {
@@ -15,6 +23,8 @@ import { AutoFailoverConfigPanel } from "@/components/proxy/AutoFailoverConfigPa
 import { FailoverQueueManager } from "@/components/proxy/FailoverQueueManager";
 import { RectifierConfigPanel } from "@/components/settings/RectifierConfigPanel";
 import { GlobalProxySettings } from "@/components/settings/GlobalProxySettings";
+import { LocalControlSettings } from "@/components/settings/LocalControlSettings";
+import { ProxyHookSettings } from "@/components/settings/ProxyHookSettings";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ToggleRow } from "@/components/ui/toggle-row";
 import { useProxyStatus } from "@/hooks/useProxyStatus";
@@ -134,6 +144,56 @@ export function ProxyTabContent({
               onToggleProxy={handleToggleProxy}
               isProxyPending={isProxyPending}
             />
+          </AccordionContent>
+        </AccordionItem>
+
+        {/* Authenticated local control API */}
+        <AccordionItem
+          value="localControl"
+          className="rounded-xl glass-card overflow-hidden"
+        >
+          <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
+            <div className="flex items-center gap-3">
+              <RadioTower className="h-5 w-5 text-emerald-500" />
+              <div className="text-left">
+                <h3 className="text-base font-semibold">
+                  {t("proxy.localControl.title", {
+                    defaultValue: "Remote route synchronization",
+                  })}
+                </h3>
+                <p className="text-sm text-muted-foreground font-normal">
+                  {t("proxy.localControl.description", {
+                    defaultValue:
+                      "Manage the loopback-only API used by the local sync program.",
+                  })}
+                </p>
+              </div>
+            </div>
+          </AccordionTrigger>
+          <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
+            <LocalControlSettings />
+          </AccordionContent>
+        </AccordionItem>
+
+        <AccordionItem
+          value="proxyHooks"
+          className="rounded-xl glass-card overflow-hidden"
+        >
+          <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
+            <div className="flex items-center gap-3">
+              <Webhook className="h-5 w-5 text-violet-500" />
+              <div className="text-left">
+                <h3 className="text-base font-semibold">
+                  请求、响应与 Tool Call Hook
+                </h3>
+                <p className="text-sm text-muted-foreground font-normal">
+                  配置默认关闭的回环策略服务、超时和失败策略。
+                </p>
+              </div>
+            </div>
+          </AccordionTrigger>
+          <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
+            <ProxyHookSettings />
           </AccordionContent>
         </AccordionItem>
 

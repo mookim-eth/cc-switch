@@ -139,3 +139,76 @@ export interface AppProxyConfig {
   circuitErrorRateThreshold: number;
   circuitMinRequests: number;
 }
+
+export interface LocalControlConfig {
+  enabled: boolean;
+  tokenConfigured: boolean;
+  allowHttpLoopback: boolean;
+}
+
+export interface ProxyInteractionRecordingConfig {
+  recordBodies: boolean;
+  apps: string[];
+  models: string[];
+  providers: string[];
+  maxBodyBytes: number;
+  retentionDays: number;
+  quotaMb: number;
+  recordRawSse: boolean;
+}
+
+export interface ProxyHookConfig {
+  enabled: boolean;
+  endpoint: string;
+  bearerToken: string;
+  timeoutMs: number;
+  maxPayloadBytes: number;
+  failClosed: boolean;
+  allowRequestReplace: boolean;
+  sensitiveStrings: string[];
+}
+
+export interface ProxyInteractionFilters {
+  appType?: string;
+  model?: string;
+  providerId?: string;
+  statusCode?: number;
+  hookHit?: boolean;
+  requestId?: string;
+  createdAfter?: number;
+  createdBefore?: number;
+}
+
+export interface ProxyInteractionSummary {
+  requestId: string;
+  sessionId?: string;
+  appType: string;
+  clientModel: string;
+  outboundModel?: string;
+  finalProviderId?: string;
+  statusCode?: number;
+  isStreaming: boolean;
+  hookHit: boolean;
+  createdAt: number;
+  completedAt?: number;
+  retentionUntil: number;
+}
+
+export interface ProxyInteractionDetail extends ProxyInteractionSummary {
+  requestPayloadRedacted?: string;
+  upstreamRequestPayloadRedacted?: string;
+  responsePayloadRedacted?: string;
+  hookEventsJson: string;
+  redactionApplied: boolean;
+}
+
+export interface ProxyInteractionAttempt {
+  requestId: string;
+  attemptIndex: number;
+  providerId: string;
+  endpointOrigin?: string;
+  statusCode?: number;
+  errorCode?: string;
+  startedAt: number;
+  completedAt?: number;
+}

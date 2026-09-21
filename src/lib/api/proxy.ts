@@ -5,6 +5,13 @@ import type {
   ProxyTakeoverStatus,
   GlobalProxyConfig,
   AppProxyConfig,
+  LocalControlConfig,
+  ProxyInteractionAttempt,
+  ProxyInteractionDetail,
+  ProxyInteractionFilters,
+  ProxyInteractionRecordingConfig,
+  ProxyInteractionSummary,
+  ProxyHookConfig,
 } from "@/types/proxy";
 
 export const proxyApi = {
@@ -28,6 +35,60 @@ export const proxyApi = {
   // 获取代理服务器状态
   async getProxyStatus(): Promise<ProxyStatus> {
     return invoke("get_proxy_status");
+  },
+
+  async getLocalControlConfig(): Promise<LocalControlConfig> {
+    return invoke("get_local_control_config");
+  },
+
+  async setLocalControlEnabled(enabled: boolean): Promise<string | null> {
+    return invoke("set_local_control_enabled", { enabled });
+  },
+
+  async rotateLocalControlToken(): Promise<string> {
+    return invoke("rotate_local_control_token");
+  },
+
+  async setLocalControlAllowHttpLoopback(allowed: boolean): Promise<void> {
+    return invoke("set_local_control_allow_http_loopback", { allowed });
+  },
+
+  async getInteractionRecordingConfig(): Promise<ProxyInteractionRecordingConfig> {
+    return invoke("get_proxy_interaction_recording_config");
+  },
+
+  async getHookConfig(): Promise<ProxyHookConfig> {
+    return invoke("get_proxy_hook_config");
+  },
+
+  async saveHookConfig(config: ProxyHookConfig): Promise<void> {
+    return invoke("save_proxy_hook_config", { config });
+  },
+
+  async saveInteractionRecordingConfig(
+    config: ProxyInteractionRecordingConfig,
+  ): Promise<void> {
+    return invoke("save_proxy_interaction_recording_config", { config });
+  },
+
+  async listInteractions(
+    filters: ProxyInteractionFilters,
+    page = 0,
+    pageSize = 50,
+  ): Promise<ProxyInteractionSummary[]> {
+    return invoke("list_proxy_interactions", { filters, page, pageSize });
+  },
+
+  async getInteraction(
+    requestId: string,
+  ): Promise<ProxyInteractionDetail | null> {
+    return invoke("get_proxy_interaction", { requestId, confirmed: true });
+  },
+
+  async listInteractionAttempts(
+    requestId: string,
+  ): Promise<ProxyInteractionAttempt[]> {
+    return invoke("list_proxy_interaction_attempts", { requestId });
   },
 
   // ========== 接管状态 API ==========
